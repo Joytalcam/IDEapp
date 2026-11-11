@@ -1,0 +1,35 @@
+﻿# Entorno virtual local (incompatible con Linux, no se copia)
+.venv/
+venv/
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Control de versiones
+.git/
+.gitignore
+
+# Datos locales (se montan como volumen)
+data/
+historial_predicciones.json
+*.corrupto
+*.tmp
+
+# IDE / Editores
+.vscode/
+.idea/
+*.swp
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Documentación local
+SETUP_LOCAL.md
+CAMBIOS_LOCALES.md
+
+# Backups
+*_backup.py
+requirements-py312.txt

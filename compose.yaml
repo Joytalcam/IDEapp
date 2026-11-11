@@ -1,0 +1,15 @@
+﻿services:
+  web:
+    build: .
+    container_name: tfm-ide-app
+    ports:
+      - "5000:5000"
+    volumes:
+      # Mapea ./data de tu PC a /app/data del contenedor
+      # Así el historial persiste aunque borres el contenedor
+      - ./data:/app/data
+    environment:
+      # Variables que app.py ya reconoce
+      - DATA_DIR=/app/data
+      - FLASK_DEBUG=false
+    restart: unless-stopped

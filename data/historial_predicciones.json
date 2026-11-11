@@ -1,0 +1,47 @@
+[
+  {
+    "fecha_hora": "2026-11-11 19:49:38",
+    "lbs_tot_equiv": 10500.0,
+    "ide_modelo": 0.37974739300786986,
+    "ide_baseline": 0.786082638295231,
+    "kwh": 3987.3476265826334,
+    "eficiencia_operacional": 0.01984126984126984,
+    "desviacion_ide": -51.69116139857458,
+    "datos_entrada": {
+      "Aves Ingresadas": 5000.0,
+      "Peso Promedio": 2.1,
+      "Horas Productivas": 18.0,
+      "LbsTotEquiv": 10500.0
+    }
+  },
+  {
+    "fecha_hora": "2026-11-11 20:01:00",
+    "lbs_tot_equiv": 10500.0,
+    "ide_modelo": 0.37974739300786986,
+    "ide_baseline": 0.786082638295231,
+    "kwh": 3987.3476265826334,
+    "eficiencia_operacional": 0.01984126984126984,
+    "desviacion_ide": -51.69116139857458,
+    "datos_entrada": {
+      "Aves Ingresadas": 5000.0,
+      "Peso Promedio": 2.1,
+      "Horas Productivas": 18.0,
+      "LbsTotEquiv": 10500.0
+    }
+  },
+  {
+    "fecha_hora": "2026-11-11 20:09:58",
+    "lbs_tot_equiv": 15999.98,
+    "ide_modelo": -2.9518441333400527,
+    "ide_baseline": 0.5819842112488488,
+    "kwh": 0.0,
+    "eficiencia_operacional": 1.0,
+    "desviacion_ide": -607.2034732704944,
+    "datos_entrada": {
+      "Aves Ingresadas": 1000000.0,
+      "Peso Promedio": 4.0,
+      "Horas Productivas": 11.0,
+      "LbsTotEquiv": 15999.98
+    }
+  }
+]

@@ -10,35 +10,66 @@ import json
 
 app = Flask(__name__)
 
-# Configuración del modelo
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+# Rutas del modelo y scaler
 MODEL_PATH = "Modelo/Modelo.joblib"
 SCALER_PATH = "Modelo/scaler_X.joblib"
 
-# IMPORTANTE: Usa EXACTAMENTE los mismos nombres que usaste al entrenar el modelo
+# Ruta del historial: usa DATA_DIR si existe (para Docker), si no, la raíz
+DATA_DIR = os.environ.get('DATA_DIR', '.')
+os.makedirs(DATA_DIR, exist_ok=True)  # Crear carpeta si no existe
+HISTORIAL_FILE = os.path.join(DATA_DIR, "historial_predicciones.json")
+
+# Features del modelo (mismo orden que en entrenamiento)
 FEATURES = ['Aves Ingresadas', 'Peso Promedio', 'Horas Productivas', 'LbsTotEquiv']
 
-# Parámetros de la ecuación de línea base
+# Parámetros de la ecuación de línea base: IDE = A * lbs^B
 A_BASELINE = 582.6204656920573
 B_BASELINE = -0.713698689160424
 
-# Almacenamiento histórico en memoria
+# Capacidad nominal de la planta (aves procesadas por hora)
+# Fuente: [COMPLETAR - ej: ficha técnica de la línea, promedio histórico, etc.]
+CAPACIDAD_NOMINAL_AVES_HORA = 14000
+
+# Límite máximo de registros en historial (evita crecimiento indefinido)
+MAX_HISTORIAL = 1000
+
+# Flag de debug (activar con: $env:DEBUG_PREDICCION="true" antes de correr)
+DEBUG_PREDICCION = os.environ.get('DEBUG_PREDICCION', 'false').lower() == 'true'
+
+# ============================================================
+# ESTADO GLOBAL
+# ============================================================
+
 historial_predicciones = []
-
-# Archivo para persistencia (opcional)
-HISTORIAL_FILE = "historial_predicciones.json"
-
-# Variables globales para modelo y scaler
 modelo_cargado = None
 scaler_cargado = None
 
 
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def debug_print(*args, **kwargs):
+    """Imprime solo si DEBUG_PREDICCION está activo"""
+    if DEBUG_PREDICCION:
+        print(*args, **kwargs)
+
+
+# ============================================================
+# CARGA DE MODELO Y SCALER
+# ============================================================
+
 def cargar_modelo():
-    """Carga el modelo (lo guardamos en joblib después del entrenamiento)"""
+    """Carga el modelo (cacheado en memoria global)"""
     global modelo_cargado
     if modelo_cargado is None:
         try:
             modelo_cargado = joblib.load(MODEL_PATH)
-            print(f"✓ Modelo cargado exitosamente desde {MODEL_PATH}")
+            print(f"✓ Modelo cargado desde {MODEL_PATH}")
         except FileNotFoundError:
             raise Exception(f"No se encontró el modelo en: {MODEL_PATH}")
         except Exception as e:
@@ -47,12 +78,12 @@ def cargar_modelo():
 
 
 def cargar_scaler():
-    """Carga el scaler (necesario para normalizar los datos de entrada)"""
+    """Carga el scaler (cacheado en memoria global)"""
     global scaler_cargado
     if scaler_cargado is None:
         try:
             scaler_cargado = joblib.load(SCALER_PATH)
-            print(f"✓ Scaler cargado exitosamente desde {SCALER_PATH}")
+            print(f"✓ Scaler cargado desde {SCALER_PATH}")
         except FileNotFoundError:
             raise Exception(f"No se encontró el scaler en: {SCALER_PATH}")
         except Exception as e:
@@ -60,50 +91,103 @@ def cargar_scaler():
     return scaler_cargado
 
 
+# ============================================================
+# CÁLCULOS DE NEGOCIO
+# ============================================================
+
 def calcular_ide_baseline(lbs_tot_equiv):
-    """Calcula el IDE de línea base con la ecuación de potencia que obtuvimos"""
+    """Calcula el IDE de línea base con la ecuación de potencia"""
     return A_BASELINE * (lbs_tot_equiv ** B_BASELINE)
 
 
 def calcular_consumo_energetico(ide_modelo, lbs_tot_equiv):
     """Estima el consumo en kWh multiplicando IDE por libras procesadas"""
-    return ide_modelo * lbs_tot_equiv
+    kwh = ide_modelo * lbs_tot_equiv
+    if kwh < 0:
+        print(f"⚠️  ADVERTENCIA: consumo negativo ({kwh:.2f} kWh) — "
+              f"posible predicción fuera de rango del modelo")
+        return 0
+    return kwh
 
 
 def calcular_eficiencia_operacional(aves_ingresadas, horas_productivas):
-    """Calcula qué tan eficientes fuimos en el procesamiento (aves por hora normalizado)"""
+    """
+    Calcula la eficiencia operacional como aves/hora normalizadas
+    contra la capacidad nominal de la planta.
+    
+    Retorna un valor entre 0 y 1.0 (donde 1.0 = 100% de capacidad).
+    """
     if horas_productivas == 0:
         return 0
-    return (aves_ingresadas / horas_productivas) / 14000
+    
+    tasa_real = aves_ingresadas / horas_productivas
+    eficiencia = tasa_real / CAPACIDAD_NOMINAL_AVES_HORA
+    
+    if eficiencia > 1.0:
+        print(f"⚠️  Eficiencia {eficiencia:.2f} excede capacidad nominal "
+              f"({tasa_real:.0f} aves/h vs {CAPACIDAD_NOMINAL_AVES_HORA} nominal)")
+        return 1.0
+    
+    return eficiencia
 
 
 def calcular_desviacion_ide(ide_modelo, ide_baseline):
-    """Calcula cuánto nos desviamos del estándar (mejor o peor en %)"""
+    """Calcula la desviación porcentual del IDE respecto a la línea base"""
     if ide_baseline == 0:
         return 0
     return ((ide_modelo - ide_baseline) / ide_baseline) * 100
 
 
+# ============================================================
+# PERSISTENCIA DEL HISTORIAL
+# ============================================================
+
 def guardar_historial():
-    """Persiste el historial en JSON para no perder los datos entre sesiones"""
+    """Persiste el historial con escritura atómica (evita archivos corruptos)"""
     try:
-        with open(HISTORIAL_FILE, 'w', encoding='utf-8') as f:
+        temp_file = HISTORIAL_FILE + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(historial_predicciones, f, indent=2, ensure_ascii=False)
+        os.replace(temp_file, HISTORIAL_FILE)  # Atómico en Windows y Unix
     except Exception as e:
-        print(f"Error al guardar historial: {e}")
+        print(f"❌ Error al guardar historial: {e}")
 
 
 def cargar_historial():
-    """Recupera el historial guardado cuando inicia la app"""
+    """Recupera el historial guardado, manejando JSON corrupto con backup"""
     global historial_predicciones
     try:
-        if os.path.exists(HISTORIAL_FILE):
-            with open(HISTORIAL_FILE, 'r', encoding='utf-8') as f:
-                historial_predicciones = json.load(f)
+        if not os.path.exists(HISTORIAL_FILE):
+            print("ℹ️  No hay historial previo, empezando desde cero")
+            return
+        
+        with open(HISTORIAL_FILE, 'r', encoding='utf-8') as f:
+            datos = json.load(f)
+        
+        if isinstance(datos, list):
+            historial_predicciones = datos
+            print(f"✓ Historial cargado: {len(datos)} registros")
+        else:
+            print("⚠️  Historial con formato inválido, se reinicia vacío")
+            historial_predicciones = []
+    
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON corrupto en {HISTORIAL_FILE}: {e}")
+        backup = HISTORIAL_FILE + ".corrupto"
+        try:
+            os.rename(HISTORIAL_FILE, backup)
+            print(f"   Archivo respaldado como: {backup}")
+        except Exception as rename_err:
+            print(f"   No se pudo respaldar: {rename_err}")
+        historial_predicciones = []
     except Exception as e:
-        print(f"Error al cargar historial: {e}")
+        print(f"❌ Error al cargar historial: {e}")
         historial_predicciones = []
 
+
+# ============================================================
+# RUTAS
+# ============================================================
 
 @app.route('/')
 def index():
@@ -115,105 +199,81 @@ def index():
 def predecir():
     """Procesar la predicción con todos los cálculos del IDE y métricas"""
     try:
-        # 1. Leer y validar los valores del formulario
         valores = []
         valores_dict = {}
         
-        print("\n\n")
-        print("█" * 60)
-        print("█ DEBUG - NUEVA PREDICCIÓN")
-        print("█" * 60)
+        debug_print("\n\n" + "█" * 60)
+        debug_print("█ DEBUG - NUEVA PREDICCIÓN")
+        debug_print("█" * 60)
         
-        # Imprimir TODOS los datos del formulario
-        print("\n1. DATOS DEL FORMULARIO:")
+        # 1. Datos del formulario
+        debug_print("\n1. DATOS DEL FORMULARIO:")
         for key in request.form:
-            print(f"     '{key}' = '{request.form.get(key)}'")
+            debug_print(f"     '{key}' = '{request.form.get(key)}'")
         
-        print("\n2. PROCESANDO FEATURES:")
+        # 2. Validar y procesar features
+        debug_print("\n2. PROCESANDO FEATURES:")
         for feature in FEATURES:
             valor = request.form.get(feature)
-            print(f"     '{feature}' -> {valor}", end="")
+            debug_print(f"     '{feature}' -> {valor}", end="")
             
             if not valor:
-                return render_template('index.html', 
+                return render_template('index.html',
                                      features=FEATURES,
                                      error=f"El campo '{feature}' es obligatorio")
+            
             try:
                 valor_float = float(valor)
+                if valor_float <= 0:
+                    return render_template('index.html',
+                                         features=FEATURES,
+                                         error=f"El campo '{feature}' debe ser mayor a cero")
                 valores.append(valor_float)
                 valores_dict[feature] = valor_float
-                print(f" ✓ ({valor_float})")
+                debug_print(f" ✓ ({valor_float})")
             except ValueError:
                 return render_template('index.html',
                                      features=FEATURES,
                                      error=f"El campo '{feature}' debe ser un número válido")
         
-        # DEBUG: Imprimir valores recibidos
-        print("\n3. VALORES PROCESADOS:")
-        print(f"     Lista: {valores}")
-        print(f"     Dict: {valores_dict}")
-        
-        # 2. Preparar datos para el modelo en el ORDEN CORRECTO
-        # Usar DataFrame para mantener los nombres de las columnas
+        # 3. Preparar DataFrame
         df_entrada = pd.DataFrame([valores], columns=FEATURES)
-        print("\n4. DATAFRAME DE ENTRADA:")
-        print(df_entrada)
-        print(f"     Columnas: {list(df_entrada.columns)}")
+        debug_print("\n3. DATAFRAME DE ENTRADA:")
+        debug_print(df_entrada)
         
-        # 3. Cargar el scaler y aplicarlo
+        # 4. Aplicar scaler
         scaler_X = cargar_scaler()
-        print("\n5. APLICANDO SCALER...")
-        
-        # Transformar y mantener como DataFrame para el Pipeline
         datos_escalados_array = scaler_X.transform(df_entrada)
-        df_escalado = pd.DataFrame(
-            datos_escalados_array,
-            columns=FEATURES
-        )
+        df_escalado = pd.DataFrame(datos_escalados_array, columns=FEATURES)
+        debug_print("\n4. DATOS ESCALADOS:")
+        debug_print(df_escalado)
         
-        print(f"     Array: {datos_escalados_array[0]}")
-        print("     DataFrame escalado:")
-        print(df_escalado)
-        
-        # 4. Cargar el modelo y hacer predicción
+        # 5. Predecir
         modelo = cargar_modelo()
-        print("\n6. PREDICCIÓN:")
-        print(f"     Tipo de modelo: {type(modelo).__name__}")
-        
         ide_modelo = modelo.predict(df_escalado)[0]
+        debug_print(f"\n5. IDE MODELO: {ide_modelo}")
         
-        print(f"     ✓ IDE MODELO: {ide_modelo}")
-        print("█" * 60)
-        print("\n")
-        
-        # 5. Realizar todos los cálculos adicionales
-        # IMPORTANTE: Usar el nombre correcto de la variable
+        # 6. Cálculos adicionales
         lbs_tot_equiv = valores_dict['LbsTotEquiv']
         aves_ingresadas = valores_dict['Aves Ingresadas']
         horas_productivas = valores_dict['Horas Productivas']
         
-        # Cálculo IDE de línea base
         ide_baseline = calcular_ide_baseline(lbs_tot_equiv)
-        print(f"IDE Baseline calculado: {ide_baseline}")
-        
-        # Cálculo consumo energético
         kwh = calcular_consumo_energetico(ide_modelo, lbs_tot_equiv)
-        print(f"Consumo energético (kWh): {kwh}")
-        
-        # Cálculo eficiencia operacional
         eficiencia_op = calcular_eficiencia_operacional(aves_ingresadas, horas_productivas)
-        print(f"Eficiencia operacional: {eficiencia_op}")
-        
-        # Cálculo desviación IDE
         desviacion_ide = calcular_desviacion_ide(ide_modelo, ide_baseline)
-        print(f"Desviación IDE (%): {desviacion_ide}")
-        print("="*60 + "\n")
         
-        # 6. Guardar en historial
+        debug_print(f"   IDE Baseline: {ide_baseline:.4f}")
+        debug_print(f"   Consumo (kWh): {kwh:.4f}")
+        debug_print(f"   Eficiencia op: {eficiencia_op:.4f}")
+        debug_print(f"   Desviación IDE: {desviacion_ide:.2f}%")
+        debug_print("=" * 60 + "\n")
+        
+        # 7. Guardar en historial
         registro = {
             'fecha_hora': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'lbs_tot_equiv': lbs_tot_equiv,
-            'ide_modelo': float(ide_modelo),  # Asegurar que sea float serializable
+            'lbs_tot_equiv': float(lbs_tot_equiv),
+            'ide_modelo': float(ide_modelo),
             'ide_baseline': float(ide_baseline),
             'kwh': float(kwh),
             'eficiencia_operacional': float(eficiencia_op),
@@ -222,9 +282,11 @@ def predecir():
         }
         
         historial_predicciones.append(registro)
+        if len(historial_predicciones) > MAX_HISTORIAL:
+            historial_predicciones.pop(0)
         guardar_historial()
         
-        # 7. Preparar datos para la vista
+        # 8. Preparar respuesta
         resultados = {
             'ide_modelo': float(ide_modelo),
             'ide_baseline': float(ide_baseline),
@@ -251,7 +313,14 @@ def predecir():
 @app.route('/api/historial')
 def api_historial():
     """Devolver el historial en JSON (para consumo de APIs)"""
-    return jsonify(historial_predicciones)
+    try:
+        return jsonify({
+            'success': True,
+            'total': len(historial_predicciones),
+            'data': historial_predicciones
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/historial')
@@ -266,49 +335,55 @@ def limpiar_historial():
     global historial_predicciones
     historial_predicciones = []
     guardar_historial()
-    return render_template('index.html', 
+    return render_template('index.html',
                          features=FEATURES,
                          mensaje="Historial limpiado correctamente")
 
 
+# ============================================================
+# ARRANQUE
+# ============================================================
+
 if __name__ == '__main__':
-    # Cargar historial previo si existe
+    # Cargar historial previo
     cargar_historial()
     
-    # Verificar que existen el modelo y scaler antes de iniciar
-    print("\n" + "="*60)
+    # Banner de arranque
+    print("\n" + "=" * 60)
     print("  SISTEMA DE MONITOREO ENERGÉTICO INDUSTRIAL")
     print("  Predicción IDE - Análisis de Desempeño")
-    print("="*60)
+    print("=" * 60)
     
-    # Verificar modelo
+    # Verificar modelo y scaler
     if not os.path.exists(MODEL_PATH):
-        print(f"❌ ERROR: No se encuentra el modelo en:")
-        print(f"   {MODEL_PATH}")
-        print("   Por favor, verifica la ruta del modelo.")
+        print(f"❌ ERROR: No se encuentra el modelo en: {MODEL_PATH}")
     else:
         print(f"✓ Modelo encontrado: {MODEL_PATH}")
     
-    # Verificar scaler
     if not os.path.exists(SCALER_PATH):
-        print(f"❌ ERROR: No se encuentra el scaler en:")
-        print(f"   {SCALER_PATH}")
-        print("   Por favor, verifica la ruta del scaler.")
+        print(f"❌ ERROR: No se encuentra el scaler en: {SCALER_PATH}")
     else:
         print(f"✓ Scaler encontrado: {SCALER_PATH}")
     
-    print(f"\n  Features esperadas: {FEATURES}")
-    print("  URL: http://127.0.0.1:5000")
-    print("="*60 + "\n")
+    print(f"\n  Features: {FEATURES}")
+    print(f"  Debug: {'ACTIVO' if DEBUG_PREDICCION else 'inactivo'}")
+    print(f"  URL: http://127.0.0.1:5000")
+    print("=" * 60 + "\n")
     
-    # Cargar modelo y scaler al inicio
+    # Cargar modelo y scaler
     try:
         cargar_modelo()
         cargar_scaler()
     except Exception as e:
         print(f"❌ Error al cargar modelo/scaler: {e}")
     
-    threading.Timer(1.0, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
-
-    # Iniciar servidor Flask
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    # Abrir navegador solo en uso local (no en Docker)
+    # En Docker no hay navegador, así que saltamos esta parte
+    EN_DOCKER = os.environ.get('DATA_DIR') is not None
+    if not EN_DOCKER and os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        threading.Timer(1.0, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
+    
+    # Iniciar servidor (host y debug dinámicos según entorno)
+    host = '0.0.0.0' if EN_DOCKER else '127.0.0.1'
+    debug_mode = os.environ.get('FLASK_DEBUG', 'true').lower() == 'true'
+    app.run(debug=debug_mode, host=host, port=5000)
